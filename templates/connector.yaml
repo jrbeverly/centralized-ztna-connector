@@ -1,0 +1,164 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+  BootstrapSecretArn:
+    Type: String
+  ConnectorGroup:
+    Type: String
+
+Resources:
+
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ztna-connector-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: BootstrapSecret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref BootstrapSecretArn
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "ztna-connector-${AWS::Region}"
+      Roles:
+        - !Ref Role
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VpcId
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcId
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetId
+      RouteTableId: !Ref RouteTable
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ZTNA connector
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+        InstanceType: t3.micro
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref SecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: ManagedBy
+                Value: ZTNA
+              - Key: Component
+                Value: Connector
+              - Key: Environment
+                Value: Production
+              - Key: AccountClass
+                Value: Application
+              - Key: VPC
+                Value: !Ref VpcId
+              - Key: ConnectorGroup
+                Value: !Ref ConnectorGroup
+          - ResourceType: volume
+            Tags:
+              - Key: ManagedBy
+                Value: ZTNA
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -e
+
+            aws secretsmanager get-secret-value \
+              --region ${AWS::Region} \
+              --secret-id ${BootstrapSecretArn} \
+              --query SecretString \
+              --output text > /dev/null
+
+            cat > /usr/local/bin/ztna-mock << 'SCRIPT'
+            #!/bin/bash
+            while true; do
+              echo "ztna-mock active"
+              sleep 30
+            done
+            SCRIPT
+            chmod +x /usr/local/bin/ztna-mock
+
+            cat > /etc/systemd/system/ztna-mock.service << 'UNIT'
+            [Unit]
+            Description=ZTNA Mock Connector
+            After=network.target
+
+            [Service]
+            ExecStart=/usr/local/bin/ztna-mock
+            Restart=always
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+
+            systemctl daemon-reload
+            systemctl enable ztna-mock
+            systemctl start ztna-mock
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: DefaultRoute
+    Properties:
+      AutoScalingGroupName: !Sub "ztna-connector-${AWS::Region}"
+      MinSize: "1"
+      MaxSize: "1"
+      DesiredCapacity: "1"
+      VPCZoneIdentifier:
+        - !Ref SubnetId
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber

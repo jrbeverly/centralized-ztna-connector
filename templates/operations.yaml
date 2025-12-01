@@ -1,0 +1,321 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Conditions:
+  IsCentralRegion: !Equals [!Ref "AWS::Region", "ca-central-1"]
+
+Resources:
+
+  AutomationRole:
+    Type: AWS::IAM::Role
+    Condition: IsCentralRegion
+    Properties:
+      RoleName: ZTNA-AutomationRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ZTNAFleetOps
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                  - ssm:ListCommands
+                  - ssm:DescribeInstanceInformation
+                  - ec2:DescribeInstances
+                  - ec2:TerminateInstances
+                  - autoscaling:DescribeAutoScalingGroups
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ssm:StartAutomationExecution
+                  - ssm:GetAutomationExecution
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/ZTNA-AutomationRole"
+
+  ReplaceUnhealthyWorker:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Name: ZTNA-ReplaceUnhealthy-Worker
+      Content:
+        schemaVersion: "0.3"
+        description: Identify and replace unhealthy connectors in this Region
+        assumeRole: !Sub "arn:aws:iam::${AWS::AccountId}:role/ZTNA-AutomationRole"
+        outputs:
+          - IdentifyAndReplace.OldInstanceIds
+          - IdentifyAndReplace.NewInstanceIds
+          - IdentifyAndReplace.Status
+        mainSteps:
+          - name: IdentifyAndReplace
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.11
+              Handler: handler
+              InputPayload:
+                Region: "{{global:REGION}}"
+              Script: |
+                import boto3, time
+
+                def handler(events, context):
+                    region = events['Region']
+                    ssm = boto3.client('ssm', region_name=region)
+                    ec2 = boto3.client('ec2', region_name=region)
+                    asg_client = boto3.client('autoscaling', region_name=region)
+                    asg_name = 'ztna-connector-' + region
+
+                    cmd = ssm.send_command(
+                        Targets=[{'Key': 'tag:Component', 'Values': ['Connector']}],
+                        DocumentName='AWS-RunShellScript',
+                        Parameters={'commands': ['STATUS=$(systemctl is-active ztna-mock); echo "ztna-mock: $STATUS"; [ "$STATUS" = active ]']},
+                        MaxConcurrency='10', MaxErrors='100%'
+                    )
+                    cmd_id = cmd['Command']['CommandId']
+
+                    for _ in range(30):
+                        time.sleep(10)
+                        if ssm.list_commands(CommandId=cmd_id)['Commands'][0]['StatusDetails'] not in ('Pending', 'InProgress'):
+                            break
+
+                    inv = ssm.list_command_invocations(CommandId=cmd_id, Details=False)['CommandInvocations']
+                    unhealthy = [i['InstanceId'] for i in inv if i['StatusDetails'] != 'Success']
+
+                    if not unhealthy:
+                        return {'OldInstanceIds': ['none'], 'NewInstanceIds': ['none'], 'Status': 'AllHealthy'}
+
+                    ec2.terminate_instances(InstanceIds=unhealthy)
+                    unhealthy_set = set(unhealthy)
+
+                    for _ in range(20):
+                        time.sleep(10)
+                        resp = ec2.describe_instances(InstanceIds=unhealthy)
+                        states = [i['State']['Name'] for r in resp['Reservations'] for i in r['Instances']]
+                        if all(s == 'terminated' for s in states):
+                            break
+
+                    new_ids = []
+                    for _ in range(30):
+                        time.sleep(30)
+                        resp = asg_client.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])
+                        if resp['AutoScalingGroups']:
+                            asg = resp['AutoScalingGroups'][0]
+                            fresh = [i for i in asg['Instances'] if i['LifecycleState'] == 'InService' and i['InstanceId'] not in unhealthy_set]
+                            if len(fresh) >= asg['DesiredCapacity']:
+                                new_ids = [i['InstanceId'] for i in fresh]
+                                break
+                    else:
+                        return {'OldInstanceIds': unhealthy, 'NewInstanceIds': ['none'], 'Status': 'ASGRecoveryTimeout'}
+
+                    for _ in range(30):
+                        time.sleep(30)
+                        info = ssm.describe_instance_information(Filters=[{'Key': 'InstanceIds', 'Values': new_ids}])
+                        online = {i['InstanceId'] for i in info['InstanceInformationList'] if i['PingStatus'] == 'Online'}
+                        if online >= set(new_ids):
+                            break
+                    else:
+                        return {'OldInstanceIds': unhealthy, 'NewInstanceIds': new_ids, 'Status': 'SSMRegistrationTimeout'}
+
+                    cmd = ssm.send_command(
+                        InstanceIds=new_ids,
+                        DocumentName='AWS-RunShellScript',
+                        Parameters={'commands': ['STATUS=$(systemctl is-active ztna-mock); echo "ztna-mock: $STATUS"; [ "$STATUS" = active ]']}
+                    )
+                    cmd_id = cmd['Command']['CommandId']
+
+                    for _ in range(20):
+                        time.sleep(15)
+                        done = [i for i in ssm.list_command_invocations(CommandId=cmd_id, Details=False)['CommandInvocations']
+                                if i['StatusDetails'] not in ('Pending', 'InProgress', 'Delayed')]
+                        if len(done) >= len(new_ids):
+                            failed = [i for i in done if i['StatusDetails'] != 'Success']
+                            return {'OldInstanceIds': unhealthy, 'NewInstanceIds': new_ids, 'Status': 'FinalHealthCheckFailed' if failed else 'Success'}
+
+                    return {'OldInstanceIds': unhealthy, 'NewInstanceIds': new_ids, 'Status': 'FinalHealthCheckTimeout'}
+            outputs:
+              - Name: OldInstanceIds
+                Selector: "$.Payload.OldInstanceIds"
+                Type: StringList
+              - Name: NewInstanceIds
+                Selector: "$.Payload.NewInstanceIds"
+                Type: StringList
+              - Name: Status
+                Selector: "$.Payload.Status"
+                Type: String
+
+  ReplaceUnhealthy:
+    Type: AWS::SSM::Document
+    Condition: IsCentralRegion
+    Properties:
+      DocumentType: Automation
+      Name: ZTNA-ReplaceUnhealthy
+      Content:
+        schemaVersion: "0.3"
+        description: Parameter-free replacement of unhealthy connectors across all connector Regions
+        assumeRole: !Sub "arn:aws:iam::${AWS::AccountId}:role/ZTNA-AutomationRole"
+        mainSteps:
+          - name: FanOutReplacement
+            action: aws:executeAutomation
+            inputs:
+              DocumentName: ZTNA-ReplaceUnhealthy-Worker
+              TargetLocations:
+                - Accounts:
+                    - !Sub "${AWS::AccountId}"
+                  Regions:
+                    - ca-central-1
+                    - us-east-1
+                  ExecutionRoleName: ZTNA-AutomationRole
+                  TargetLocationMaxConcurrency: "2"
+                  TargetLocationMaxErrors: "0"
+
+  HealthCheckWorker:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Name: ZTNA-HealthCheck-Worker
+      Content:
+        schemaVersion: "0.3"
+        description: Check SSM reachability and ztna-mock service health for all connectors in this Region
+        assumeRole: !Sub "arn:aws:iam::${AWS::AccountId}:role/ZTNA-AutomationRole"
+        mainSteps:
+          - name: CheckConnectorHealth
+            action: aws:runCommand
+            inputs:
+              DocumentName: AWS-RunShellScript
+              Targets:
+                - Key: tag:Component
+                  Values:
+                    - Connector
+              Parameters:
+                commands:
+                  - |
+                    STATUS=$(systemctl is-active ztna-mock)
+                    echo "ztna-mock: $STATUS"
+                    [ "$STATUS" = active ]
+              MaxConcurrency: "1"
+              MaxErrors: "0"
+
+  HealthCheck:
+    Type: AWS::SSM::Document
+    Condition: IsCentralRegion
+    Properties:
+      DocumentType: Automation
+      Name: ZTNA-HealthCheck
+      Content:
+        schemaVersion: "0.3"
+        description: Parameter-free fleet health check across all connector Regions
+        assumeRole: !Sub "arn:aws:iam::${AWS::AccountId}:role/ZTNA-AutomationRole"
+        mainSteps:
+          - name: FanOutHealthCheck
+            action: aws:executeAutomation
+            inputs:
+              DocumentName: ZTNA-HealthCheck-Worker
+              TargetLocations:
+                - Accounts:
+                    - !Sub "${AWS::AccountId}"
+                  Regions:
+                    - ca-central-1
+                    - us-east-1
+                  ExecutionRoleName: ZTNA-AutomationRole
+                  TargetLocationMaxConcurrency: "2"
+                  TargetLocationMaxErrors: "0"
+
+  RestartWorker:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Name: ZTNA-ControlledRestart-Worker
+      Content:
+        schemaVersion: "0.3"
+        description: Restart ztna-mock on production connectors in this Region and verify the restarted service
+        assumeRole: !Sub "arn:aws:iam::${AWS::AccountId}:role/ZTNA-AutomationRole"
+        mainSteps:
+          - name: CaptureStartTime
+            action: aws:runCommand
+            inputs:
+              DocumentName: AWS-RunShellScript
+              Targets:
+                - Key: tag:Component
+                  Values:
+                    - Connector
+                - Key: tag:Environment
+                  Values:
+                    - Production
+              Parameters:
+                commands:
+                  - |
+                    systemctl show ztna-mock -p ActiveEnterTimestamp --value | tee /tmp/ztna-restart-before
+              MaxConcurrency: "1"
+              MaxErrors: "0"
+          - name: RestartService
+            action: aws:runCommand
+            inputs:
+              DocumentName: AWS-RunShellScript
+              Targets:
+                - Key: tag:Component
+                  Values:
+                    - Connector
+                - Key: tag:Environment
+                  Values:
+                    - Production
+              Parameters:
+                commands:
+                  - systemctl restart ztna-mock
+              MaxConcurrency: "1"
+              MaxErrors: "0"
+          - name: VerifyRestart
+            action: aws:runCommand
+            inputs:
+              DocumentName: AWS-RunShellScript
+              Targets:
+                - Key: tag:Component
+                  Values:
+                    - Connector
+                - Key: tag:Environment
+                  Values:
+                    - Production
+              Parameters:
+                commands:
+                  - |
+                    BEFORE=$(cat /tmp/ztna-restart-before)
+                    AFTER=$(systemctl show ztna-mock -p ActiveEnterTimestamp --value)
+                    STATUS=$(systemctl is-active ztna-mock)
+                    echo "before: $BEFORE"
+                    echo "after:  $AFTER"
+                    echo "ztna-mock: $STATUS"
+                    [ "$STATUS" = active ] && [ "$AFTER" != "$BEFORE" ]
+              MaxConcurrency: "1"
+              MaxErrors: "0"
+
+  ControlledRestart:
+    Type: AWS::SSM::Document
+    Condition: IsCentralRegion
+    Properties:
+      DocumentType: Automation
+      Name: ZTNA-ControlledRestart
+      Content:
+        schemaVersion: "0.3"
+        description: Parameter-free controlled restart of ztna-mock across all connector Regions
+        assumeRole: !Sub "arn:aws:iam::${AWS::AccountId}:role/ZTNA-AutomationRole"
+        mainSteps:
+          - name: FanOutControlledRestart
+            action: aws:executeAutomation
+            inputs:
+              DocumentName: ZTNA-ControlledRestart-Worker
+              TargetLocations:
+                - Accounts:
+                    - !Sub "${AWS::AccountId}"
+                  Regions:
+                    - ca-central-1
+                    - us-east-1
+                  ExecutionRoleName: ZTNA-AutomationRole
+                  TargetLocationMaxConcurrency: "2"
+                  TargetLocationMaxErrors: "0"
